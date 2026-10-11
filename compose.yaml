@@ -1,0 +1,27 @@
+services:
+  tgntf:
+    image: ghcr.io/zuoban/tgntf:${TGNTF_TAG:-0.1.0}
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      STATE_PATH: /data/notifications.db
+      HEALTH_ADDR: 127.0.0.1:8080
+    volumes:
+      - notifications:/data
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  notifications:
