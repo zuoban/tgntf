@@ -102,7 +102,7 @@ func (s *Store) Ack(item Item, now time.Time) error {
 	})
 }
 
-// Prune keeps pending markers indefinitely; only delivered markers expire after 30 days.
+// Prune keeps pending markers indefinitely; acknowledged markers expire after 30 days.
 func (s *Store) Prune(now time.Time) error {
 	cutoff := uint64(now.Add(-30 * 24 * time.Hour).UnixMilli())
 	return s.db.Update(func(tx *bolt.Tx) error {

@@ -42,3 +42,38 @@ func TestLoad(t *testing.T) {
 		t.Fatal("expected disabled markets error")
 	}
 }
+
+func TestLoadExcludedSymbols(t *testing.T) {
+	for _, test := range []struct {
+		name, value string
+		want        []string
+	}{
+		{name: "default"},
+		{name: "empty entries", value: " , , \t"},
+		{name: "one symbol", value: "BTCUSDT", want: []string{"BTCUSDT"}},
+		{name: "normalized and deduplicated", value: " btcusdt, ETHusdt ,BTCUSDT,, ", want: []string{"BTCUSDT", "ETHUSDT"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			env := validEnv()
+			env["EXCLUDED_SYMBOLS"] = test.value
+			cfg, err := Load(func(k string) string { return env[k] })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(cfg.ExcludedSymbols) != len(test.want) {
+				t.Fatalf("unexpected exclusions: %v", cfg.ExcludedSymbols)
+			}
+			for _, symbol := range test.want {
+				if !cfg.ExcludesSymbol(symbol) || !cfg.ExcludesSymbol(" "+symbol+" ") {
+					t.Fatalf("symbol %q not excluded", symbol)
+				}
+			}
+			if cfg.ExcludesSymbol("BTCUSDC") || cfg.ExcludesSymbol("BTC") || cfg.ExcludesSymbol("") {
+				t.Fatal("exclusion must match a complete configured symbol")
+			}
+			if len(test.want) > 0 && !cfg.ExcludesSymbol("btcusdt") {
+				t.Fatal("exclusion must be case-insensitive")
+			}
+		})
+	}
+}

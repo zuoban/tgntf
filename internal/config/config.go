@@ -13,6 +13,7 @@ type Config struct {
 	Spot, Futures, PartialFills              bool
 	SpotREST, SpotWS, FuturesREST, FuturesWS string
 	TelegramAPI, StatePath, HealthAddr       string
+	ExcludedSymbols                          map[string]struct{}
 	Location                                 *time.Location
 }
 
@@ -30,6 +31,14 @@ func Load(getenv func(string) string) (Config, error) {
 		TelegramAPI:   value(getenv, "TELEGRAM_API_URL", "https://api.telegram.org"),
 		StatePath:     value(getenv, "STATE_PATH", "data/notifications.db"),
 		HealthAddr:    value(getenv, "HEALTH_ADDR", "127.0.0.1:8080"),
+	}
+	for _, symbol := range strings.Split(getenv("EXCLUDED_SYMBOLS"), ",") {
+		if symbol = strings.ToUpper(strings.TrimSpace(symbol)); symbol != "" {
+			if c.ExcludedSymbols == nil {
+				c.ExcludedSymbols = make(map[string]struct{})
+			}
+			c.ExcludedSymbols[symbol] = struct{}{}
+		}
 	}
 	for _, field := range []struct{ name, value string }{
 		{"BINANCE_API_KEY", c.APIKey}, {"BINANCE_SECRET_KEY", c.SecretKey},
@@ -74,6 +83,12 @@ func Load(getenv func(string) string) (Config, error) {
 		}
 	}
 	return c, nil
+}
+
+// ExcludesSymbol matches a complete Binance symbol across both markets.
+func (c Config) ExcludesSymbol(symbol string) bool {
+	_, excluded := c.ExcludedSymbols[strings.ToUpper(strings.TrimSpace(symbol))]
+	return excluded
 }
 
 func value(getenv func(string) string, name, fallback string) string {

@@ -75,6 +75,9 @@ func Run(parent context.Context, cfg config.Config, logger *slog.Logger) error {
 	})
 	notify := make(chan struct{}, 1)
 	handler := func(fill trade.Fill) error {
+		if cfg.ExcludesSymbol(fill.Symbol) {
+			return nil
+		}
 		added, err := db.Enqueue(fill)
 		if err != nil {
 			return err
@@ -95,7 +98,7 @@ func Run(parent context.Context, cfg config.Config, logger *slog.Logger) error {
 		launch(func() error { return client.Run(ctx, "futures", handler) })
 	}
 	launch(func() error {
-		return Deliver(ctx, db, telegram.New(cfg.TelegramToken, cfg.ChatID, cfg.TelegramAPI), cfg.Location, logger, notify, setDelivery)
+		return Deliver(ctx, db, telegram.New(cfg.TelegramToken, cfg.ChatID, cfg.TelegramAPI), cfg, logger, notify, setDelivery)
 	})
 	logger.Info("Binance notification bot started", "spot", cfg.Spot, "futures", cfg.Futures, "partial_fills", cfg.PartialFills)
 	select {
@@ -111,8 +114,8 @@ func Run(parent context.Context, cfg config.Config, logger *slog.Logger) error {
 	return err
 }
 
-// Deliver sends the oldest persisted fill first and acknowledges only a successful API response.
-func Deliver(ctx context.Context, db *store.Store, sender Sender, location *time.Location, logger *slog.Logger, notify <-chan struct{}, state func(bool)) error {
+// Deliver processes persisted fills in order, skipping excluded symbols and acknowledging successful deliveries.
+func Deliver(ctx context.Context, db *store.Store, sender Sender, cfg config.Config, logger *slog.Logger, notify <-chan struct{}, state func(bool)) error {
 	poll := time.NewTicker(time.Second)
 	defer poll.Stop()
 	prune := time.NewTicker(time.Hour)
@@ -139,7 +142,13 @@ func Deliver(ctx context.Context, db *store.Store, sender Sender, location *time
 			}
 			continue
 		}
-		err = sender.Send(ctx, item.Fill.Message(location))
+		if cfg.ExcludesSymbol(item.Fill.Symbol) {
+			if err := db.Ack(*item, time.Now()); err != nil {
+				return fmt.Errorf("acknowledge excluded notification: %w", err)
+			}
+			continue
+		}
+		err = sender.Send(ctx, item.Fill.Message(cfg.Location))
 		if ctx.Err() != nil {
 			return nil
 		}

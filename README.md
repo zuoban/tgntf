@@ -5,6 +5,7 @@ Go 实现，监听一个币安账户的**现货 + U 本位合约**成交，通�
 - 现货：WebSocket API `userDataStream.subscribe.signature`，使用 HMAC SHA-256 签名。
 - 合约：`/fapi/v1/listenKey` + 私有 WebSocket，每 30 分钟续期。
 - 默认每笔实际成交发送一次，包含部分成交；挂单、撤单、账户余额变化不会触发通知。
+- 可通过 `EXCLUDED_SYMBOLS` 排除指定交易对，现货和合约均不发送这些交易对的通知。
 - 通知包含买卖方向、成交价/量/额、累计成交量与均价、手续费、订单/成交 ID 和时间；合约另含持仓方向、仅减仓标志及本次已实现盈亏。
 - 两个市场独立连接，心跳检测、指数退避重连，连接在 24 小时限制前轮换。
 - bbolt 持久化通知队列和去重记录；Telegram 网络错误、5xx、429 自动重试并遵守 `retry_after`。
@@ -43,6 +44,7 @@ TELEGRAM_CHAT_ID=你的数字ChatID
 ENABLE_SPOT=true
 ENABLE_FUTURES=true
 NOTIFY_PARTIAL_FILLS=true
+EXCLUDED_SYMBOLS=
 NOTIFY_TIMEZONE=Asia/Shanghai
 ```
 
@@ -57,6 +59,7 @@ NOTIFY_TIMEZONE=Asia/Shanghai
 | `ENABLE_SPOT` | `true` | 现货监听开关 |
 | `ENABLE_FUTURES` | `true` | U 本位合约监听开关 |
 | `NOTIFY_PARTIAL_FILLS` | `true` | `false` 仅在订单最后一笔成交、状态为 FILLED 时通知 |
+| `EXCLUDED_SYMBOLS` | 空 | 排除通知的完整交易对，英文逗号分隔，如 `BTCUSDT,ETHUSDT`；现货和合约共同生效，忽略大小写及两侧空白 |
 | `NOTIFY_TIMEZONE` | `Asia/Shanghai` | 通知显示时区 |
 | `STATE_PATH` | `data/notifications.db` | 本地队列路径；Compose 固定为 `/data/notifications.db` |
 | `HEALTH_ADDR` | `127.0.0.1:8080` | 容器内部健康服务；Compose 固定为此值 |
@@ -69,9 +72,11 @@ NOTIFY_TIMEZONE=Asia/Shanghai
 
 至少开启一个市场。所有远程地址必须为 HTTPS/WSS。可以替换为官方测试网接口，但测试网密钥不能用于主网，且现货与合约测试网凭据一般不同，本程序每个实例使用一组币安密钥；分别测试时关闭另一市场。
 
+例如设置 `EXCLUDED_SYMBOLS=BTCUSDT,ETHUSDT` 后，这两个交易对的成交不再通知，其他交易对正常通知。交易对按完整名称匹配，不支持通配符；留空表示不排除任何交易对。更新后重启程序或重建容器生效，队列中尚未发送的排除交易对通知也会移除，取消排除不会补发已跳过的通知。
+
 ## 3. 使用公开容器镜像
 
-GitHub 仓库：[zuoban/tgntf](https://github.com/zuoban/tgntf)。公开镜像 `ghcr.io/zuoban/tgntf:0.1.0` 支持 `linux/amd64` 和 `linux/arm64`，公开后可匿名拉取，不需要 `docker login`。
+GitHub 仓库：[zuoban/tgntf](https://github.com/zuoban/tgntf)。公开镜像 `ghcr.io/zuoban/tgntf:0.1.1` 支持 `linux/amd64` 和 `linux/arm64`，公开后可匿名拉取，不需要 `docker login`。
 
 克隆仓库并按上文填写 `.env`，然后直接拉取运行：
 
@@ -81,7 +86,7 @@ docker compose up -d --no-build
 docker compose logs -f --tail=100
 ```
 
-`.env` 的 `TGNTF_TAG` 默认是 `0.1.0`，也可以设置为 `v0.1.0` 或 `latest`。建议生产使用具体版本。新版镜像发布后，修改版本并再次执行 `pull` 和 `up` 即可更新，数据卷会继续保留。
+`.env` 的 `TGNTF_TAG` 默认是 `0.1.1`，也可以设置为 `v0.1.1` 或 `latest`。建议生产使用具体版本。新版镜像发布后，修改版本并再次执行 `pull` 和 `up` 即可更新，数据卷会继续保留。
 
 ## 从源码构建部署
 
@@ -149,9 +154,9 @@ ETHUSDT | 卖出 🔴
 
 ## 投递语义与边界
 
-- 每笔成交以 `市场 + 交易对 + 订单 ID + 成交 ID` 去重。已发送的去重记录保留 30 天，待发送记录一直保留到成功投递。一个订单可对应多笔通知。
+- 每笔成交以 `市场 + 交易对 + 订单 ID + 成交 ID` 去重。已发送或因排除配置而移除的队列记录，其去重标记保留 30 天；其他待发送记录一直保留到成功投递。一个订单可对应多笔通知。
 - `NOTIFY_PARTIAL_FILLS=false` 不汇总整单手续费/盈亏；通知中的“本次”字段仍然仅指最后一笔成交，“累计”字段来自币安整单累计值。
-- 接收到的成交先落盘再发送，Telegram 故障期间持续接收并排队。长时间故障会占用更多磁盘；磁盘写入失败时程序退出，无法落盘的事件没有保证。
+- 非排除交易对的成交先落盘再发送，Telegram 故障期间持续接收并排队。长时间故障会占用更多磁盘；磁盘写入失败时程序退出，无法落盘的事件没有保证。
 - Telegram 不提供发送消息的幂等键。若消息已经送达，但 HTTP 响应丢失或进程在确认入库前退出，重试可能重复发送。这是至少一次投递语义，不能保证严格恰好一次。
 - **本项目监听实时成交，不自动补发历史成交。启动前、停机期间以及 WebSocket 断线窗口内发生的成交可能遗漏。** 自动重连不能恢复未收到的事件。如需历史补偿，应另加指定交易对的 REST 成交历史对账。
 - 接收普通现货 `executionReport` 和标准合约 `ORDER_TRADE_UPDATE` 的 `TRADE` 成交；不会把 `TRADE_LITE` 重复推送或 `CALCULATED` 强平状态事件视为普通成交记录。币本位合约、杠杆、Convert 等其他产品需独立数据流。
@@ -164,8 +169,8 @@ ETHUSDT | 卖出 🔴
 GitHub Actions 在每次 main 提交及 PR 上执行竞态测试、静态检查和编译。推送 `v*` 版本标签会在测试通过后构建两个架构的镜像并发布到 GHCR，使用 Actions 自带的 `GITHUB_TOKEN`，无需存入币安或 Telegram 密钥。镜像包含源码仓库与提交版本的 OCI 元数据。
 
 ```sh
-git tag -a v0.1.1 -m "Release v0.1.1"
-git push origin v0.1.1
+git tag -a v0.1.2 -m "Release v0.1.2"
+git push origin v0.1.2
 gh run list --workflow ci-publish.yaml
 ```
 
