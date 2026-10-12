@@ -217,7 +217,7 @@ func (c *Client) session(parent context.Context, market string, handler Handler)
 			c.Logger.Info("Binance user data stream subscribed", "market", market)
 			continue
 		}
-		fill, err := trade.Parse(market, data, c.Config.PartialFills)
+		fill, err := trade.Parse(market, data)
 		if errors.Is(err, trade.ErrStreamEnded) {
 			return err
 		}

@@ -23,17 +23,18 @@ import (
 
 // Exercise both Binance protocols, durable deduplication, Telegram retry and shutdown together.
 func TestBothMarketsToTelegram(t *testing.T) {
-	t.Run("default", func(t *testing.T) { testBothMarketsToTelegram(t, nil) })
+	t.Run("default", func(t *testing.T) { testBothMarketsToTelegram(t, nil, true) })
+	t.Run("partial notifications disabled", func(t *testing.T) { testBothMarketsToTelegram(t, nil, false) })
 	t.Run("excluded symbols", func(t *testing.T) {
-		testBothMarketsToTelegram(t, map[string]struct{}{"BTCUSDT": {}, "ETHUSDT": {}})
+		testBothMarketsToTelegram(t, map[string]struct{}{"BTCUSDT": {}, "ETHUSDT": {}}, true)
 	})
 }
 
-func testBothMarketsToTelegram(t *testing.T, excludedSymbols map[string]struct{}) {
+func testBothMarketsToTelegram(t *testing.T, excludedSymbols map[string]struct{}, partialFills bool) {
 	t.Helper()
 	upgrader := websocket.Upgrader{}
-	spot := `{"subscriptionId":0,"event":{"e":"executionReport","E":1728973001334,"s":"BTCUSDT","S":"BUY","o":"LIMIT","O":1728973001000,"r":"NONE","x":"TRADE","X":"FILLED","i":10,"t":20,"T":1728973001334,"l":"0.01","L":"60000","z":"0.01","Z":"600","n":"0","N":null}}`
-	futures := `{"e":"ORDER_TRADE_UPDATE","E":1728973001334,"o":{"s":"ETHUSDT","S":"SELL","o":"MARKET","x":"TRADE","X":"FILLED","i":11,"t":21,"T":1728973001334,"l":"1","L":"3000","z":"1","ap":"3000","n":"1.2","N":"USDT","rp":"5","ps":"LONG","R":true}}`
+	spot := `{"subscriptionId":0,"event":{"e":"executionReport","E":1728973001334,"s":"BTCUSDT","S":"BUY","o":"LIMIT","O":1728973001000,"r":"NONE","x":"TRADE","X":"FILLED","i":10,"t":20,"T":1728973001334,"l":"0.006","L":"60000","z":"0.01","Z":"600","n":"0.3","N":"BNB"}}`
+	futures := `{"e":"ORDER_TRADE_UPDATE","E":1728973001334,"o":{"s":"ETHUSDT","S":"SELL","o":"MARKET","x":"TRADE","X":"FILLED","i":11,"t":21,"T":1728973001334,"l":"0.6","L":"3000","z":"1","ap":"3000","n":"0.7","N":"USDT","rp":"3","ps":"LONG","R":true}}`
 	binance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v3/time":
@@ -60,10 +61,15 @@ func testBothMarketsToTelegram(t *testing.T, excludedSymbols map[string]struct{}
 			_ = conn.WriteMessage(websocket.TextMessage, []byte(strings.Replace(spot, `"x":"TRADE"`, `"x":"NEW"`, 1)))
 			payload = spot
 		}
+		partial := strings.NewReplacer(`"X":"FILLED"`, `"X":"PARTIALLY_FILLED"`, `"t":20`, `"t":18`, `"t":21`, `"t":19`,
+			`"l":"0.006"`, `"l":"0.004"`, `"z":"0.01"`, `"z":"0.004"`, `"Z":"600"`, `"Z":"240"`, `"n":"0.3"`, `"n":"0.2"`,
+			`"l":"0.6"`, `"l":"0.4"`, `"z":"1"`, `"z":"0.4"`, `"n":"0.7"`, `"n":"0.5"`, `"rp":"3"`, `"rp":"2"`).Replace(payload)
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(partial))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(partial))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(payload))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(payload))
 		if len(excludedSymbols) > 0 {
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(strings.Replace(payload, `"X":"FILLED"`, `"X":"PARTIALLY_FILLED"`, 1)))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(strings.Replace(partial, "USDT", "USDC", 1)))
 			payload = strings.Replace(payload, "USDT", "USDC", 1)
 			_ = conn.WriteMessage(websocket.TextMessage, []byte(payload))
 			_ = conn.WriteMessage(websocket.TextMessage, []byte(payload))
@@ -99,7 +105,7 @@ func testBothMarketsToTelegram(t *testing.T, excludedSymbols map[string]struct{}
 	defer telegram.Close()
 	path := filepath.Join(t.TempDir(), "notifications.db")
 	wsBase := "ws" + strings.TrimPrefix(binance.URL, "http")
-	cfg := config.Config{APIKey: "key", SecretKey: "secret", TelegramToken: "123:test", ChatID: "1", Spot: true, Futures: true, PartialFills: true, SpotREST: binance.URL, SpotWS: wsBase + "/ws-api/v3", FuturesREST: binance.URL, FuturesWS: wsBase + "/private/ws", TelegramAPI: telegram.URL, StatePath: path, HealthAddr: "127.0.0.1:0", Location: time.UTC}
+	cfg := config.Config{APIKey: "key", SecretKey: "secret", TelegramToken: "123:test", ChatID: "1", Spot: true, Futures: true, PartialFills: partialFills, SpotREST: binance.URL, SpotWS: wsBase + "/ws-api/v3", FuturesREST: binance.URL, FuturesWS: wsBase + "/private/ws", TelegramAPI: telegram.URL, StatePath: path, HealthAddr: "127.0.0.1:0", Location: time.UTC}
 	cfg.ExcludedSymbols = excludedSymbols
 	spotSymbol, futuresSymbol := "BTCUSDT", "ETHUSDT"
 	if len(excludedSymbols) > 0 {
@@ -113,11 +119,20 @@ func testBothMarketsToTelegram(t *testing.T, excludedSymbols map[string]struct{}
 	for range 2 {
 		select {
 		case message := <-messages:
+			if !strings.Contains(message, "成交笔数：2") || strings.Contains(message, "成交记录不完整") || strings.Contains(message, "本次") {
+				t.Errorf("expected one complete summary per order: %s", message)
+			}
 			if strings.Contains(message, spotSymbol) {
 				seen["spot"] = true
+				if !strings.Contains(message, "手续费：0.5 BNB") || !strings.Contains(message, "成交额：600") {
+					t.Errorf("spot totals incorrect: %s", message)
+				}
 			}
 			if strings.Contains(message, futuresSymbol) {
 				seen["futures"] = true
+				if !strings.Contains(message, "手续费：1.2 USDT") || !strings.Contains(message, "已实现盈亏：5") || !strings.Contains(message, "成交额：3000") {
+					t.Errorf("futures totals incorrect: %s", message)
+				}
 			}
 		case <-ctx.Done():
 			t.Fatal("notification pipeline timed out")

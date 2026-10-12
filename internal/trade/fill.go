@@ -4,9 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
-	"strings"
-	"time"
 
 	"github.com/shopspring/decimal"
 )
@@ -27,6 +24,7 @@ type Fill struct {
 	CumulativeQuantity string `json:"cumulative_quantity"`
 	AveragePrice       string `json:"average_price"`
 	QuoteQuantity      string `json:"quote_quantity"`
+	CumulativeQuote    string `json:"cumulative_quote,omitempty"`
 	Commission         string `json:"commission"`
 	CommissionAsset    string `json:"commission_asset"`
 	RealizedProfit     string `json:"realized_profit,omitempty"`
@@ -36,7 +34,24 @@ type Fill struct {
 }
 
 func (f Fill) Key() string {
+	if !f.IsTrade() {
+		return fmt.Sprintf("%s:status:%s", f.OrderKey(), f.Status)
+	}
 	return fmt.Sprintf("%s:%s:%d:%d", f.Market, f.Symbol, f.OrderID, f.TradeID)
+}
+
+func (f Fill) OrderKey() string {
+	return fmt.Sprintf("%s:%s:%d", f.Market, f.Symbol, f.OrderID)
+}
+
+func (f Fill) IsTrade() bool { return f.TradeID >= 0 }
+
+func (f Fill) Terminal() bool {
+	switch f.Status {
+	case "FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH":
+		return true
+	}
+	return false
 }
 
 // Binance distinguishes l/L, x/X, s/S, ap/AP and other case variants.
@@ -65,8 +80,9 @@ type execution struct {
 	ReduceOnly bool   `json:"R"`
 }
 
-// Parse ignores account updates, new/canceled orders and TRADE_LITE duplicate events.
-func Parse(market string, data []byte, partial bool) (*Fill, error) {
+// Parse retains every trade and terminal updates for orders with executed quantity.
+// Orders without executions, account updates and TRADE_LITE duplicates are ignored.
+func Parse(market string, data []byte) (*Fill, error) {
 	if market != "spot" && market != "futures" {
 		return nil, errors.New("unsupported market")
 	}
@@ -100,8 +116,47 @@ func Parse(market string, data []byte, partial bool) (*Fill, error) {
 	if err != nil {
 		return nil, errors.New("invalid order event")
 	}
-	if e.Execution != "TRADE" || (!partial && e.Status != "FILLED") {
+	terminal := (Fill{Status: e.Status}).Terminal()
+	if e.Execution != "TRADE" && (!terminal || e.Execution == "CALCULATED") {
 		return nil, nil
+	}
+	isTrade := e.Execution == "TRADE"
+	cumulative, err := positive(e.Cumulative)
+	if err != nil {
+		if !isTrade {
+			if quantity, parseErr := decimal.NewFromString(e.Cumulative); parseErr == nil && quantity.IsZero() {
+				return nil, nil
+			}
+		}
+		return nil, errors.New("invalid cumulative quantity")
+	}
+	if e.Symbol == "" || e.OrderID <= 0 || e.Time <= 0 || (e.Side != "BUY" && e.Side != "SELL") {
+		return nil, errors.New("invalid fill identifiers")
+	}
+	average := e.Average
+	cumulativeQuote := ""
+	if market == "spot" {
+		quote, err := positive(e.Quote)
+		if err != nil {
+			return nil, errors.New("invalid cumulative quote quantity")
+		}
+		average = quote.DivRound(cumulative, 16).String()
+		cumulativeQuote = quote.String()
+	}
+	if _, err := positive(average); err != nil {
+		return nil, errors.New("invalid average price")
+	}
+	fill := &Fill{
+		Market: market, Symbol: e.Symbol, Side: e.Side, OrderType: e.Type, Status: e.Status,
+		OrderID: e.OrderID, TradeID: -1, Time: e.Time,
+		CumulativeQuantity: cumulative.String(), AveragePrice: average, CumulativeQuote: cumulativeQuote,
+		PositionSide: e.Position, ReduceOnly: e.ReduceOnly,
+	}
+	if !isTrade {
+		return fill, nil
+	}
+	if e.TradeID == nil || *e.TradeID < 0 {
+		return nil, errors.New("invalid fill identifiers")
 	}
 	qty, err := positive(e.Quantity)
 	if err != nil {
@@ -111,24 +166,6 @@ func Parse(market string, data []byte, partial bool) (*Fill, error) {
 	if err != nil {
 		return nil, errors.New("invalid fill price")
 	}
-	cumulative, err := positive(e.Cumulative)
-	if err != nil {
-		return nil, errors.New("invalid cumulative quantity")
-	}
-	if e.Symbol == "" || e.OrderID <= 0 || e.TradeID == nil || *e.TradeID < 0 || e.Time <= 0 || (e.Side != "BUY" && e.Side != "SELL") {
-		return nil, errors.New("invalid fill identifiers")
-	}
-	average := e.Average
-	if market == "spot" {
-		quote, err := positive(e.Quote)
-		if err != nil {
-			return nil, errors.New("invalid cumulative quote quantity")
-		}
-		average = quote.DivRound(cumulative, 16).String()
-	}
-	if _, err := positive(average); err != nil {
-		return nil, errors.New("invalid average price")
-	}
 	quoteQuantity := qty.Mul(price).String()
 	if market == "spot" && e.LastQuote != "" {
 		q, err := positive(e.LastQuote)
@@ -137,14 +174,16 @@ func Parse(market string, data []byte, partial bool) (*Fill, error) {
 		}
 		quoteQuantity = q.String()
 	}
-	return &Fill{
-		Market: market, Symbol: e.Symbol, Side: e.Side, OrderType: e.Type, Status: e.Status,
-		OrderID: e.OrderID, TradeID: *e.TradeID, Time: e.Time,
-		Price: price.String(), Quantity: qty.String(), CumulativeQuantity: cumulative.String(),
-		AveragePrice: average, QuoteQuantity: quoteQuantity,
-		Commission: e.Commission, CommissionAsset: e.Asset, RealizedProfit: e.Profit,
-		PositionSide: e.Position, Maker: e.Maker, ReduceOnly: e.ReduceOnly,
-	}, nil
+	for _, amount := range []string{e.Commission, e.Profit} {
+		if amount != "" {
+			if _, err := decimal.NewFromString(amount); err != nil {
+				return nil, errors.New("invalid commission or realized profit")
+			}
+		}
+	}
+	fill.TradeID, fill.Price, fill.Quantity, fill.QuoteQuantity = *e.TradeID, price.String(), qty.String(), quoteQuantity
+	fill.Commission, fill.CommissionAsset, fill.RealizedProfit, fill.Maker = e.Commission, e.Asset, e.Profit, e.Maker
+	return fill, nil
 }
 
 func decodeExecution(data []byte) (execution, error) {
@@ -178,37 +217,4 @@ func positive(s string) (decimal.Decimal, error) {
 		err = errors.New("value is not positive")
 	}
 	return d, err
-}
-
-func (f Fill) Message(location *time.Location) string {
-	esc := html.EscapeString
-	market := "现货"
-	if f.Market == "futures" {
-		market = "U 本位合约"
-	}
-	side := "买入 🟢"
-	if f.Side == "SELL" {
-		side = "卖出 🔴"
-	}
-	status := "部分成交"
-	if f.Status == "FILLED" {
-		status = "完全成交"
-	}
-	liquidity := "Taker"
-	if f.Maker {
-		liquidity = "Maker"
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "<b>币安成交 · %s</b>\n<b>%s</b> | %s\n状态：%s · %s\n", market, esc(f.Symbol), side, status, esc(f.OrderType))
-	fmt.Fprintf(&b, "本次成交价：%s\n本次成交量：%s\n本次成交额：%s（计价币）\n累计成交量：%s\n累计均价：%s\n", esc(f.Price), esc(f.Quantity), esc(f.QuoteQuantity), esc(f.CumulativeQuantity), esc(f.AveragePrice))
-	fee := f.Commission
-	if fee == "" {
-		fee = "0"
-	}
-	fmt.Fprintf(&b, "本次手续费：%s %s\n流动性：%s\n", esc(fee), esc(f.CommissionAsset), liquidity)
-	if f.Market == "futures" {
-		fmt.Fprintf(&b, "持仓方向：%s\n仅减仓：%t\n本次已实现盈亏：%s（结算币，未扣手续费）\n", esc(f.PositionSide), f.ReduceOnly, esc(f.RealizedProfit))
-	}
-	fmt.Fprintf(&b, "订单 ID：<code>%d</code>\n成交 ID：<code>%d</code>\n时间：%s", f.OrderID, f.TradeID, time.UnixMilli(f.Time).In(location).Format("2006-01-02 15:04:05.000 -07:00"))
-	return b.String()
 }

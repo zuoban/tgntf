@@ -10,7 +10,7 @@ import (
 
 type Config struct {
 	APIKey, SecretKey, TelegramToken, ChatID string
-	Spot, Futures, PartialFills              bool
+	Spot, Futures, PartialFills              bool // PartialFills also notifies partially executed orders when canceled/expired.
 	SpotREST, SpotWS, FuturesREST, FuturesWS string
 	TelegramAPI, StatePath, HealthAddr       string
 	ExcludedSymbols                          map[string]struct{}

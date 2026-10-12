@@ -114,7 +114,7 @@ func Run(parent context.Context, cfg config.Config, logger *slog.Logger) error {
 	return err
 }
 
-// Deliver processes persisted fills in order, skipping excluded symbols and acknowledging successful deliveries.
+// Deliver sends one summary for each completed order, retaining open orders on disk.
 func Deliver(ctx context.Context, db *store.Store, sender Sender, cfg config.Config, logger *slog.Logger, notify <-chan struct{}, state func(bool)) error {
 	poll := time.NewTicker(time.Second)
 	defer poll.Stop()
@@ -123,9 +123,12 @@ func Deliver(ctx context.Context, db *store.Store, sender Sender, cfg config.Con
 	if err := db.Prune(time.Now()); err != nil {
 		return err
 	}
+	if err := db.DiscardExcluded(cfg.ExcludesSymbol, time.Now()); err != nil {
+		return fmt.Errorf("discard excluded notifications: %w", err)
+	}
 	backoff := time.Second
 	for ctx.Err() == nil {
-		item, err := db.Next()
+		item, err := db.NextOrder()
 		if err != nil {
 			return err
 		}
@@ -142,13 +145,14 @@ func Deliver(ctx context.Context, db *store.Store, sender Sender, cfg config.Con
 			}
 			continue
 		}
-		if cfg.ExcludesSymbol(item.Fill.Symbol) {
-			if err := db.Ack(*item, time.Now()); err != nil {
-				return fmt.Errorf("acknowledge excluded notification: %w", err)
+		fill := item.Order.Fill
+		if cfg.ExcludesSymbol(fill.Symbol) || (!cfg.PartialFills && fill.Status != "FILLED") {
+			if err := db.AckOrder(*item, time.Now()); err != nil {
+				return fmt.Errorf("acknowledge skipped order: %w", err)
 			}
 			continue
 		}
-		err = sender.Send(ctx, item.Fill.Message(cfg.Location))
+		err = sender.Send(ctx, item.Order.Message(cfg.Location))
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -169,12 +173,12 @@ func Deliver(ctx context.Context, db *store.Store, sender Sender, cfg config.Con
 			backoff = min(backoff*2, time.Minute)
 			continue
 		}
-		if err := db.Ack(*item, time.Now()); err != nil {
+		if err := db.AckOrder(*item, time.Now()); err != nil {
 			return fmt.Errorf("acknowledge sent notification: %w", err)
 		}
 		state(true)
 		backoff = time.Second
-		logger.Info("Fill notification delivered", "market", item.Fill.Market, "symbol", item.Fill.Symbol, "order_id", item.Fill.OrderID, "trade_id", item.Fill.TradeID)
+		logger.Info("Order summary delivered", "market", fill.Market, "symbol", fill.Symbol, "order_id", fill.OrderID, "trades", item.Order.TradeCount, "complete_records", item.Order.Complete())
 		// Telegram recommends avoiding more than one message per second in one chat.
 		if !wait(ctx, time.Second) {
 			return nil
